@@ -276,7 +276,8 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	float* __restrict__ out_feature_map,
-	float* __restrict__ out_depth) 
+	float* __restrict__ out_depth,
+	float* __restrict__ pixels) 
 {
 
 	// Identify current tile and associated min/max pixel range.
@@ -309,6 +310,7 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 
 	float C[CHANNELS] = { 0 };
+	float ZB = 0;
 	float F[NUM_FEATURE_CHANNELS] = { 0 };
 	
 	// Added for depth computation
@@ -384,6 +386,18 @@ renderCUDA(
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
+
+			// ratio compute
+			float A = con_o.x;
+			float B = con_o.y;
+			float C = con_o.z;
+			float delta = sqrt((A - C) * (A - C) + 4.0f * B * B);
+			float lambda1 = 0.5f * (A + C + delta);
+			float lambda2 = 0.5f * (A + C - delta);
+			if (lambda1 > 0.0f && lambda2 > 0.0f) {
+				float aspect_ratio = sqrt(lambda1 / lambda2);
+				ZB += aspect_ratio * alpha_T;
+			}
 		}
 	}
 
@@ -402,6 +416,7 @@ renderCUDA(
 		}
 		out_alpha[pix_id] = weight;
 		out_depth[pix_id] = D;
+		pixels[pix_id] = ZB;
 	}
 }
 
@@ -420,7 +435,8 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* out_feature_map,
-	float* out_depth) 
+	float* out_depth,
+	float* pixels) 
 {
 	renderCUDA<NUM_COLOR_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -436,7 +452,8 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		out_feature_map,
-		out_depth);
+		out_depth,
+		pixels);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

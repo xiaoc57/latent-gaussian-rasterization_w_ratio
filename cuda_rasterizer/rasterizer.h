@@ -54,6 +54,7 @@ namespace CudaRasterizer
 			float* out_alpha,
 			float* out_depth,
 			int* radii = nullptr,
+			float* pixels = nullptr,
 			bool debug = false
 			);
 
