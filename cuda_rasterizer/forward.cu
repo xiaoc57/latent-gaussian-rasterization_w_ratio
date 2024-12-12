@@ -173,6 +173,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
+	int* ccount,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
@@ -248,6 +249,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
+	ccount[idx] = 0;
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
@@ -262,6 +264,147 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // and rasterizing data.
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDACount(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ colors,
+	const float* __restrict__ features,
+	const float* __restrict__ depths,
+	uint32_t* __restrict__ ccount,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ out_alpha,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	float* __restrict__ out_color,
+	float* __restrict__ out_feature_map,
+	float* __restrict__ out_depth,
+	float* __restrict__ pixels) 
+{
+
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
+	
+	// Check if this thread is associated with a valid pixel or outside.
+	bool inside = pix.x < W&& pix.y < H;
+	// Done threads can help with fetching, but don't rasterize
+	bool done = !inside;
+
+	// Load start/end range of IDs to process in bit sorted list.
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	// Initialize helper variables
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+
+	float C[CHANNELS] = { 0 };
+	float ZB = 0;
+	float F[NUM_FEATURE_CHANNELS] = { 0 };
+	
+	// Added for depth computation
+	float weight = 0;
+	float D = 0;
+
+	// Iterate over batches until all done or range is complete
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// End if entire block votes that it is done rasterizing
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		// Collectively fetch per-Gaussian data from global to shared
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+		}
+
+		block.sync();
+
+		// Iterate over current batch
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+						// Keep track of current position in range
+			contributor++;
+
+			// Resample using conic matrix (cf. "Surface 
+			// Splatting" by Zwicker et al., 2001)
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			// Eq. (2) from 3D Gaussian splatting paper.
+			// Obtain alpha by multiplying with Gaussian opacity
+			// and its exponential falloff from mean.
+			// Avoid numerical instabilities (see paper appendix). 
+			float alpha = min(0.99f, con_o.w * exp(power));
+			float alpha_T = alpha * T;
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			// Eq. (3) from 3D Gaussian splatting paper.
+			if (colors){
+				for (int ch = 0; ch < CHANNELS; ch++){
+					C[ch] += colors[collected_id[j] * CHANNELS + ch] * alpha_T;
+				}
+			}
+			if (features){
+				for (int ch = 0; ch < NUM_FEATURE_CHANNELS; ch++){
+					F[ch] += features[collected_id[j] * NUM_FEATURE_CHANNELS + ch] * alpha_T; 
+				}
+			}
+
+			weight += alpha_T;
+			D += depths[collected_id[j]] * alpha_T;
+			T = test_T;
+
+			// Keep track of last range entry to update this
+			// pixel.
+			last_contributor = contributor;
+
+			if (inside)
+			{
+				// atomicAdd(ccount, 1);
+				atomicAdd(&ccount[collected_id[j]], 1);
+			}
+		}
+	}
+}
+
+
+// Main rasterization method. Collaboratively works on one tile per
+// block, each thread treats one pixel. Alternates between fetching 
+// and rasterizing data.
+template <uint32_t CHANNELS>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
@@ -270,6 +413,7 @@ renderCUDA(
 	const float* __restrict__ colors,
 	const float* __restrict__ features,
 	const float* __restrict__ depths,
+	uint32_t* __restrict__ ccount,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ out_alpha,
 	uint32_t* __restrict__ n_contrib,
@@ -388,16 +532,17 @@ renderCUDA(
 			last_contributor = contributor;
 
 			// ratio compute
-			float A = con_o.x;
-			float B = con_o.y;
-			float C = con_o.z;
-			float delta = sqrt((A - C) * (A - C) + 4.0f * B * B);
-			float lambda1 = 0.5f * (A + C + delta);
-			float lambda2 = 0.5f * (A + C - delta);
-			if (lambda1 > 0.0f && lambda2 > 0.0f) {
-				float aspect_ratio = sqrt(lambda1 / lambda2);
-				ZB += aspect_ratio * alpha_T;
-			}
+			// float A = con_o.x;
+			// float B = con_o.y;
+			// float C = con_o.z;
+			// float delta = sqrt((A - C) * (A - C) + 4.0f * B * B);
+			// float lambda1 = 0.5f * (A + C + delta);
+			// float lambda2 = 0.5f * (A + C - delta);
+			// if (lambda1 > 0.0f && lambda2 > 0.0f) {
+			// 	float aspect_ratio = sqrt(lambda1 / lambda2);
+			// 	ZB += aspect_ratio * alpha_T;
+			// }
+			ZB += ccount[collected_id[j]];
 		}
 	}
 
@@ -429,6 +574,7 @@ void FORWARD::render(
 	const float* colors,
 	const float* features,
 	const float* depths,
+	int* ccount,
 	const float4* conic_opacity,
 	float* out_alpha,
 	uint32_t* n_contrib,
@@ -446,6 +592,7 @@ void FORWARD::render(
 		colors,
 		features,
 		depths,
+		ccount,
 		conic_opacity,
 		out_alpha,
 		n_contrib,
@@ -475,6 +622,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	int* radii,
 	float2* means2D,
 	float* depths,
+	int* ccount,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
@@ -502,6 +650,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		radii,
 		means2D,
 		depths,
+		ccount,
 		cov3Ds,
 		rgb,
 		conic_opacity,
